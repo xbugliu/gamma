@@ -1,0 +1,13 @@
+namespace gamma_api;
+
+table EngineStatus {
+  index_status:int;  // UNINDEXED = 0, INDEXING = 1, INDEXED = 2
+
+  profile_mem:long;
+  index_mem:long;
+  vector_mem:long;
+  field_range_mem:long;
+  bitmap_mem:long;
+}
+
+root_type EngineStatus;

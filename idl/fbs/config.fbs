@@ -1,0 +1,9 @@
+namespace gamma_api;
+
+table Config {
+  path:string;
+  log_dir:string;
+  max_doc_size:int;
+}
+
+root_type Config;
