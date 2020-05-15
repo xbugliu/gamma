@@ -8,15 +8,21 @@
 #ifndef GAMMA_ENGINE_H_
 #define GAMMA_ENGINE_H_
 
-#include "field_range_index.h"
-#include "gamma_api.h"
-#include "profile.h"
-#include "vector_manager.h"
-
 #include <condition_variable>
 #include <string>
 
+#include "api_data/gamma_doc.h"
+#include "api_data/gamma_request.h"
+#include "api_data/gamma_response.h"
+#include "api_data/gamma_table.h"
+#include "api_data/gamma_engine_status.h"
+#include "field_range_index.h"
+#include "profile.h"
+#include "vector_manager.h"
+
 namespace tig_gamma {
+
+enum IndexStatus { UNINDEXED = 0, INDEXING, INDEXED };
 
 class GammaEngine {
  public:
@@ -27,32 +33,32 @@ class GammaEngine {
 
   int Setup(int max_doc_size);
 
-  Response *Search(const Request *request);
+  int Search(Request &request, Response &response_results);
 
-  int CreateTable(const Table *table);
+  int CreateTable(Table &table);
 
-  int Add(const Doc *doc);
-  int AddOrUpdate(const Doc *doc);
+  int Add(Doc *doc);
+  int AddOrUpdate(Doc &doc);
 
-  int Update(const Doc *doc);
-  int Update(int doc_id, std::vector<Field *> &fields_profile,
-             std::vector<Field *> &fields_vec);
+  int Update(Doc *doc);
+  int Update(int doc_id, std::vector<struct Field> &fields_profile,
+             std::vector<struct Field> &fields_vec);
 
   /**
    * Delete doc
-   * @param doc_id
+   * @param key
    * @return 0 if successed
    */
-  int Del(const std::string &doc_id);
+  int Delete(long key);
 
   /**
    * Delete doc by query
    * @param request delete request
    * @return 0 if successed
    */
-  int DelDocByQuery(Request *request);
+  int DelDocByQuery(Request &request);
 
-  Doc *GetDoc(const std::string &id);
+  int GetDoc(long id, Doc &doc);
 
   /**
    * blocking to build index
@@ -61,7 +67,7 @@ class GammaEngine {
   int BuildIndex();
   int BuildFieldIndex();
 
-  int GetIndexStatus();
+  void GetIndexStatus(EngineStatus &engine_status);
 
   int Dump();
 
@@ -69,11 +75,11 @@ class GammaEngine {
 
   int GetDocsNum();
 
-  long GetMemoryBytes();
-
  private:
   GammaEngine(const std::string &index_root_path);
   int CreateTableFromLocal(std::string &table_name);
+
+  int Indexing();
 
  private:
   std::string index_root_path_;
@@ -91,6 +97,7 @@ class GammaEngine {
 
   int max_docid_;
   int max_doc_size_;
+  int indexing_size_;
 
   std::atomic<int> delete_num_;
 
@@ -100,26 +107,29 @@ class GammaEngine {
   std::condition_variable running_cv_;
   std::condition_variable running_field_cv_;
 
-  int PackResults(const GammaResult *gamma_results, Response *response_results,
-                  const Request *request);
+  int PackResults(const GammaResult *gamma_results, Response &response_results,
+                  Request &request);
 
-  ResultItem *PackResultItem(const VectorDoc *vec_doc, const Request *request);
+  int PackResultItem(const VectorDoc *vec_doc, Request &request, struct ResultItem &result_item);
 
-  int MultiRangeQuery(const Request *request, GammaSearchCondition &condition,
-                      Response *response_results,
+  int MultiRangeQuery(Request &request, GammaSearchCondition &condition,
+                      Response &response_results,
                       MultiRangeQueryResults *range_query_result,
                       utils::OnlineLogger &logger);
 
   enum IndexStatus index_status_;
-
+ 
   int dump_docid_;  // next dump docid
   int bitmap_bytes_size_;
   const std::string date_time_format_;
+  std::string last_bitmap_filename_;  // it should be delete after next dump
 
   bool created_table_;
   string dump_backup_path_;
 
   int indexed_field_num_;
+
+  bool b_loading_;
 
 #ifdef PERFORMANCE_TESTING
   std::atomic<uint64_t> search_num_;

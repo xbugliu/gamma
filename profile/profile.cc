@@ -63,6 +63,18 @@ Profile::~Profile() {
     db_ = nullptr;
   }
 #endif
+
+#ifdef USE_BTREE
+  if (cache_mgr_) {
+    bt_mgrclose(cache_mgr_);
+    cache_mgr_ = nullptr;
+  }
+  if (main_mgr_) {
+    bt_mgrclose(main_mgr_);
+    main_mgr_ = nullptr;
+  }
+#endif
+  LOG(INFO) << "Profile deleted.";
 }
 
 int Profile::Load(const std::vector<string> &folders, int &doc_num) {
@@ -100,7 +112,7 @@ int Profile::Load(const std::vector<string> &folders, int &doc_num) {
     memcpy(str_mem_ + str_offset_, data, value.size_ - item_length_);
     for (int field_id = 0; field_id < (int)idx_attr_offset_.size();
          field_id++) {
-      if (attrs_[field_id] != STRING) continue;
+      if (attrs_[field_id] != DataType::STRING) continue;
       int field_offset = idx_attr_offset_[field_id];
       char *field = mem_ + (long)c * item_length_ + field_offset;
       memcpy((void *)field, (void *)&str_offset_, sizeof(uint64_t));
@@ -122,10 +134,20 @@ int Profile::Load(const std::vector<string> &folders, int &doc_num) {
 
 #pragma omp parallel for
   for (int i = 0; i < doc_num; ++i) {
-    char *value = nullptr;
-    int len = GetFieldString(i, idx, &value);
-    string key = string(value, len);
+    long key = -1;
+    GetField<long>(i, idx, key);
+#ifdef USE_BTREE
+    BtDb *bt = bt_open(cache_mgr_, main_mgr_);
+    BTERR bterr = bt_insertkey(
+        bt->main, reinterpret_cast<unsigned char *>(&key), sizeof(key), 0,
+        static_cast<void *>(&i), sizeof(int), Unique);
+    if (bterr) {
+      LOG(ERROR) << "Error " << bt->mgr->err;
+    }
+    bt_close(bt);
+#else
     item_to_docid_.insert(key, i);
+#endif
   }
 
   LOG(INFO) << "Profile load successed! doc num=" << doc_num;
@@ -135,17 +157,20 @@ int Profile::Load(const std::vector<string> &folders, int &doc_num) {
   return 0;
 }
 
-int Profile::CreateTable(const Table *table) {
+int Profile::CreateTable(Table &table) {
   if (table_created_) {
     return -10;
   }
-  name_ = std::string(table->name->value, table->name->len);
-  for (int i = 0; i < table->fields_num; ++i) {
-    const string name =
-        string(table->fields[i]->name->value, table->fields[i]->name->len);
-    enum DataType ftype = table->fields[i]->data_type;
-    int is_index = table->fields[i]->is_index;
-    LOG(INFO) << "Add field name [" << name << "], type [" << ftype
+  name_ = table.Name();
+  std::vector<struct FieldInfo> fields;
+  fields = table.Fields();
+
+  size_t fields_num = fields.size();
+  for (size_t i = 0; i < fields_num; ++i) {
+    const string name = fields[i].name;
+    DataType ftype = fields[i].data_type;
+    bool is_index = fields[i].is_index;
+    LOG(INFO) << "Add field name [" << name << "], type [" << (int)ftype
               << "], index [" << is_index << "]";
     int ret = AddField(name, ftype, is_index);
     if (ret != 0) {
@@ -180,6 +205,33 @@ int Profile::CreateTable(const Table *table) {
     LOG(ERROR) << "open rocks db error: " << s.ToString();
     return -1;
   }
+#endif
+
+#ifdef USE_BTREE
+  uint mainleafxtra = 0;
+  uint maxleaves = 1000000;
+  uint poolsize = 500;
+  uint leafxtra = 0;
+  uint mainpool = 500;
+  uint mainbits = 16;
+  uint bits = 16;
+
+  if (!utils::isFolderExist(db_path_.c_str())) {
+    mkdir(db_path_.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+  }
+
+  string cache_file = db_path_ + string("/cache_") + ".dis";
+  string main_file = db_path_ + string("/main_") + ".dis";
+
+  remove(cache_file.c_str());
+  remove(main_file.c_str());
+
+  cache_mgr_ =
+      bt_mgr(const_cast<char *>(cache_file.c_str()), bits, leafxtra, poolsize);
+  cache_mgr_->maxleaves = maxleaves;
+  main_mgr_ = bt_mgr(const_cast<char *>(main_file.c_str()), mainbits,
+                     mainleafxtra, mainpool);
+  main_mgr_->maxleaves = maxleaves;
 #endif
 
   table_created_ = true;
@@ -230,7 +282,7 @@ void Profile::SetFieldValue(int docid, const std::string &field,
   }
 }
 
-int Profile::AddField(const string &name, enum DataType ftype, int is_index) {
+int Profile::AddField(const string &name, DataType ftype, bool is_index) {
   if (attr_idx_map_.find(name) != attr_idx_map_.end()) {
     LOG(ERROR) << "Duplicate field " << name;
     return -1;
@@ -243,21 +295,31 @@ int Profile::AddField(const string &name, enum DataType ftype, int is_index) {
   attrs_.push_back(ftype);
   idx_attr_map_.insert(std::pair<int, string>(field_num_, name));
   attr_idx_map_.insert(std::pair<string, int>(name, field_num_));
-  attr_type_map_.insert(std::pair<string, enum DataType>(name, ftype));
-  attr_is_index_map_.insert(std::pair<string, int>(name, is_index));
+  attr_type_map_.insert(std::pair<string, DataType>(name, ftype));
+  attr_is_index_map_.insert(std::pair<string, bool>(name, is_index));
   ++field_num_;
   return 0;
 }
 
-int Profile::GetDocIDByKey(const std::string &key, int &doc_id) {
+int Profile::GetDocIDByKey(long key, int &doc_id) {
+#ifdef USE_BTREE
+  BtDb *bt = bt_open(cache_mgr_, main_mgr_);
+  int ret = bt_findkey(bt, reinterpret_cast<unsigned char *>(&key), sizeof(key),
+                       (unsigned char *)&doc_id, sizeof(int));
+  bt_close(bt);
+
+  if (ret >= 0) {
+    return 0;
+  }
+#else
   if (item_to_docid_.find(key, doc_id)) {
     return 0;
   }
-
+#endif
   return -1;
 }
 
-int Profile::Add(const std::vector<Field *> &fields, int doc_id,
+int Profile::Add(const std::vector<struct Field> &fields, int doc_id,
                  bool is_existed) {
   if (doc_id >= static_cast<int>(max_profile_size_)) {
     LOG(ERROR) << "Doc num reached upper limit [" << max_profile_size_ << "]";
@@ -267,14 +329,13 @@ int Profile::Add(const std::vector<Field *> &fields, int doc_id,
   if (fields.size() != attr_idx_map_.size()) {
     LOG(ERROR) << "Field num [" << fields.size() << "] not equal to ["
                << attr_idx_map_.size() << "]";
-    return -1;
+    return -2;
   }
-  std::vector<Field *> fields_reorder(fields.size());
-  string key;
+  std::vector<struct Field> fields_reorder(fields.size());
+  long key = -1;
   for (size_t i = 0; i < fields.size(); ++i) {
-    const auto field_value = fields[i];
-    const string &name =
-        std::string(field_value->name->value, field_value->name->len);
+    const auto &field_value = fields[i];
+    const string &name = field_value.name;
 
     auto it = attr_idx_map_.find(name);
     if (it == attr_idx_map_.end()) {
@@ -284,35 +345,42 @@ int Profile::Add(const std::vector<Field *> &fields, int doc_id,
     int field_idx = it->second;
     fields_reorder[field_idx] = field_value;
     if (name == "_id") {
-      key = string(field_value->value->value, field_value->value->len);
+      memcpy(&key, field_value.value.c_str(), sizeof(key));
     }
   }
 #ifdef DEBUG__
   printDoc(doc);
 #endif
-  if (key.empty()) {
+  if (key == -1) {
     LOG(ERROR) << "Add item error : _id is null!";
-    return -1;
+    return -3;
   }
 
-  if (is_existed) {
-    item_to_docid_.erase(key);
-  }
+#ifdef USE_BTREE
+  BtDb *bt = bt_open(cache_mgr_, main_mgr_);
 
+  BTERR bterr = bt_insertkey(bt->main, reinterpret_cast<unsigned char *>(&key),
+                             sizeof(key), 0, static_cast<void *>(&doc_id),
+                             sizeof(int), Unique);
+  if (bterr) {
+    LOG(ERROR) << "Error " << bt->mgr->err;
+  }
+  bt_close(bt);
+#else
   item_to_docid_.insert(key, doc_id);
+#endif
 
   for (size_t i = 0; i < fields_reorder.size(); ++i) {
-    const auto field_value = fields_reorder[i];
-    const string &name =
-        std::string(field_value->name->value, field_value->name->len);
+    const auto &field_value = fields_reorder[i];
+    const string &name = field_value.name;
 
     auto it = attr_idx_map_.find(name);
     if (it == attr_idx_map_.end()) {
       LOG(ERROR) << "Cannot find field name [" << name << "]";
       continue;
     }
-    SetFieldValue(doc_id, name.c_str(), field_value->value->value,
-                  field_value->value->len);
+    SetFieldValue(doc_id, name.c_str(), field_value.value.c_str(),
+                  field_value.value.size());
   }
 
   if (doc_id % 10000 == 0) {
@@ -322,13 +390,12 @@ int Profile::Add(const std::vector<Field *> &fields, int doc_id,
   return 0;
 }
 
-int Profile::Update(const std::vector<Field *> &fields, int doc_id) {
+int Profile::Update(const std::vector<Field> &fields, int doc_id) {
   if (fields.size() == 0) return 0;
 
   for (size_t i = 0; i < fields.size(); ++i) {
     const auto field_value = fields[i];
-    const string &name =
-        string(field_value->name->value, field_value->name->len);
+    const string &name = field_value.name;
     const auto &it = attr_idx_map_.find(name);
     if (it == attr_idx_map_.end()) {
       LOG(ERROR) << "Cannot find field name [" << name << "]";
@@ -337,7 +404,10 @@ int Profile::Update(const std::vector<Field *> &fields, int doc_id) {
 
     int field_id = it->second;
 
-    if (field_value->data_type == STRING) {
+    size_t value_len = field_value.value.size();
+    const char *value = field_value.value.c_str();
+
+    if (field_value.datatype == DataType::STRING) {
       size_t offset =
           (uint64_t)doc_id * item_length_ + idx_attr_offset_[field_id];
       size_t str_offset = 0;
@@ -345,13 +415,12 @@ int Profile::Update(const std::vector<Field *> &fields, int doc_id) {
       unsigned short len;
       memcpy(&len, mem_ + offset + sizeof(size_t), sizeof(unsigned short));
 
-      if (len >= field_value->value->len) {
-        memcpy(mem_ + offset + sizeof(size_t), &(field_value->value->len),
+      if (len >= value_len) {
+        memcpy(mem_ + offset + sizeof(size_t), &value_len,
                sizeof(unsigned short));
-        memcpy(str_mem_ + str_offset, field_value->value->value,
-               field_value->value->len);
+        memcpy(str_mem_ + str_offset, value, value_len);
       } else {
-        len = field_value->value->len;
+        len = value_len;
         int ofst = sizeof(uint64_t);
         if ((str_offset_ + len) >= max_str_size_) {
           LOG(ERROR) << "Str memory reached max size [" << max_str_size_ << "]";
@@ -359,13 +428,11 @@ int Profile::Update(const std::vector<Field *> &fields, int doc_id) {
         }
         memcpy(mem_ + offset, &str_offset_, sizeof(uint64_t));
         memcpy(mem_ + offset + ofst, &len, sizeof(uint16_t));
-        memcpy(str_mem_ + str_offset_, field_value->value->value,
-               sizeof(char) * len);
+        memcpy(str_mem_ + str_offset_, value, sizeof(char) * len);
         str_offset_ += len;
       }
     } else {
-      SetFieldValue(doc_id, name.c_str(), field_value->value->value,
-                    field_value->value->len);
+      SetFieldValue(doc_id, name.c_str(), value, value_len);
     }
   }
 
@@ -389,7 +456,7 @@ int Profile::GetRawDoc(int docid, vector<char> &raw_doc) {
   memcpy((void *)raw_doc.data(), mem_ + (long)docid * item_length_,
          item_length_);
   for (int i = 0; i < (int)idx_attr_offset_.size(); i++) {
-    if (attrs_[i] != STRING) continue;
+    if (attrs_[i] != DataType::STRING) continue;
     char *field = mem_ + (long)docid * item_length_ + idx_attr_offset_[i];
     uint16_t str_len = 0;
     memcpy((void *)&str_len, field + sizeof(uint64_t), sizeof(str_len));
@@ -445,76 +512,68 @@ long Profile::GetMemoryBytes() {
   return max_profile_size_ * item_length_ + max_str_size_;
 }
 
-int Profile::GetDocInfo(const int docid, Doc *&doc) {
-  if (doc == nullptr) {
-    doc = static_cast<Doc *>(malloc(sizeof(Doc)));
-    doc->fields_num = attr_type_map_.size();
-    doc->fields =
-        static_cast<Field **>(malloc(doc->fields_num * sizeof(Field *)));
-    memset(doc->fields, 0, doc->fields_num * sizeof(Field *));
-  }
-
-  int i = 0;
-  for (const auto &it : attr_type_map_) {
-    const string &attr = it.first;
-    doc->fields[i] = GetFieldInfo(docid, attr);
-    ++i;
-  }
-
-  return 0;
-}
-
-Field *Profile::GetFieldInfo(const int docid, const string &field_name) {
-  const auto &it = attr_type_map_.find(field_name);
-  if (it == attr_type_map_.end()) {
-    LOG(ERROR) << "Cannot find field [" << field_name << "]";
-    return nullptr;
-  }
-
-  enum DataType type = it->second;
-  Field *field = static_cast<Field *>(malloc(sizeof(Field)));
-  memset(field, 0, sizeof(Field));
-  field->name = StringToByteArray(field_name);
-  field->value = static_cast<ByteArray *>(malloc(sizeof(ByteArray)));
-
-  if (type != DataType::STRING) {
-    field->value->len = FTypeSize(type);
-    field->value->value = static_cast<char *>(malloc(field->value->len));
-  }
-
-  if (type == DataType::INT) {
-    int value = 0;
-    GetField<int>(docid, field_name, value);
-    memcpy(field->value->value, &value, field->value->len);
-  } else if (type == DataType::LONG) {
-    long value = 0;
-    GetField<long>(docid, field_name, value);
-    memcpy(field->value->value, &value, field->value->len);
-  } else if (type == DataType::FLOAT) {
-    float value = 0;
-    GetField<float>(docid, field_name, value);
-    memcpy(field->value->value, &value, field->value->len);
-  } else if (type == DataType::DOUBLE) {
-    double value = 0;
-    GetField<double>(docid, field_name, value);
-    memcpy(field->value->value, &value, field->value->len);
-  } else if (type == DataType::STRING) {
-    char *value;
-    field->value->len = GetFieldString(docid, field_name, &value);
-    field->value->value = static_cast<char *>(malloc(field->value->len));
-    memcpy(field->value->value, value, field->value->len);
-  }
-  field->data_type = type;
-  return field;
-}
-
-int Profile::GetDocInfo(const std::string &key, Doc *&doc) {
+int Profile::GetDocInfo(long key, Doc &doc) {
   int doc_id = 0;
   int ret = GetDocIDByKey(key, doc_id);
   if (ret < 0) {
     return ret;
   }
   return GetDocInfo(doc_id, doc);
+}
+
+int Profile::GetDocInfo(const int docid, Doc &doc) {
+  int i = 0;
+  for (const auto &it : attr_type_map_) {
+    const string &attr = it.first;
+    struct Field field;
+    GetFieldInfo(docid, attr, field);
+    doc.AddField(field);
+    ++i;
+  }
+  return 0;
+}
+
+void Profile::GetFieldInfo(const int docid, const string &field_name, struct Field &field) {
+  const auto &it = attr_type_map_.find(field_name);
+  if (it == attr_type_map_.end()) {
+    LOG(ERROR) << "Cannot find field [" << field_name << "]";
+    return;
+  }
+
+  DataType type = it->second;
+
+  std::string source;
+  field.name = field_name;
+  field.source = source;
+  field.datatype = type;
+
+  if (type == DataType::STRING) {
+    char *value;
+    int len = GetFieldString(docid, field_name, &value);
+    field.value = std::string(value, len);
+  } else {
+    int value_len = FTypeSize(type);
+
+    std::string str_value;
+    if (type == DataType::INT) {
+      int value = 0;
+      GetField<int>(docid, field_name, value);
+      str_value = std::string(reinterpret_cast<char *>(&value), value_len);
+    } else if (type == DataType::LONG) {
+      long value = 0;
+      GetField<long>(docid, field_name, value);
+      str_value = std::string(reinterpret_cast<char *>(&value), value_len);
+    } else if (type == DataType::FLOAT) {
+      float value = 0;
+      GetField<float>(docid, field_name, value);
+      str_value = std::string(reinterpret_cast<char *>(&value), value_len);
+    } else if (type == DataType::DOUBLE) {
+      double value = 0;
+      GetField<double>(docid, field_name, value);
+      str_value = std::string(reinterpret_cast<char *>(&value), value_len);
+    }
+    field.value = str_value;
+  }
 }
 
 int Profile::GetFieldString(int docid, const std::string &field,
@@ -555,6 +614,16 @@ int Profile::GetFieldRawValue(int docid, int field_id, unsigned char **value,
   return 0;
 }
 
+int Profile::GetFieldType(const std::string &field_name, enum DataType &type) {
+  const auto &it = attr_type_map_.find(field_name);
+  if (it == attr_type_map_.end()) {
+    LOG(ERROR) << "Cannot find field [" << field_name << "]";
+    return -1;
+  }
+  type = it->second;
+  return 0;
+}
+
 int Profile::GetAttrType(std::map<std::string, enum DataType> &attr_type_map) {
   for (const auto attr_type : attr_type_map_) {
     attr_type_map.insert(attr_type);
@@ -562,7 +631,7 @@ int Profile::GetAttrType(std::map<std::string, enum DataType> &attr_type_map) {
   return 0;
 }
 
-int Profile::GetAttrIsIndex(std::map<std::string, int> &attr_is_index_map) {
+int Profile::GetAttrIsIndex(std::map<std::string, bool> &attr_is_index_map) {
   for (const auto attr_is_index : attr_is_index_map_) {
     attr_is_index_map.insert(attr_is_index);
   }

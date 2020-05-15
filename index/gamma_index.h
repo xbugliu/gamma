@@ -9,6 +9,7 @@
 #define GAMMA_INDEX_H_
 
 #include <vector>
+
 #include "gamma_common_data.h"
 #include "raw_vector.h"
 
@@ -117,21 +118,30 @@ struct VectorResult {
 };
 
 struct GammaIndex {
-  GammaIndex(size_t dimension, const char *docids_bitmap, RawVector *raw_vec)
-      : d_(dimension), docids_bitmap_(docids_bitmap), raw_vec_(raw_vec) {}
+  GammaIndex(size_t dimension, const char *docids_bitmap)
+      : d_(dimension),
+        docids_bitmap_(docids_bitmap),
+        raw_vec_(nullptr),
+        raw_vec_binary_(nullptr) {}
+
+  void SetRawVectorFloat(RawVector<float> *raw_vec) { raw_vec_ = raw_vec; }
+  void SetRawVectorBinary(RawVector<uint8_t> *raw_vec) {
+    raw_vec_binary_ = raw_vec;
+  }
 
   virtual ~GammaIndex() {}
 
   virtual int Indexing() = 0;
 
   virtual int AddRTVecsToIndex() = 0;
-  virtual bool Add(int n, const float *vec) = 0;
+  virtual bool Add(int n, const uint8_t *vec) { return true; };
 
-  virtual int Update(int doc_id, const float *vec) = 0;
+  virtual bool Add(int n, const float *vec) { return true; };
+
+  virtual int Update(int doc_id, const float *vec) { return 0; };
 
   /** assign the vectors, then call search_preassign */
-  virtual int Search(const VectorQuery *query,
-                     GammaSearchCondition *condition,
+  virtual int Search(VectorQuery &query, GammaSearchCondition *condition,
                      VectorResult &result) = 0;
 
   virtual long GetTotalMemBytes() = 0;
@@ -139,10 +149,13 @@ struct GammaIndex {
   virtual int Dump(const std::string &dir, int max_vid) = 0;
   virtual int Load(const std::vector<std::string> &index_dirs) = 0;
 
+  virtual int Delete(int docid) { return -1; }
+
   int d_;
 
   const char *docids_bitmap_;
-  RawVector *raw_vec_;
+  RawVector<float> *raw_vec_;
+  RawVector<uint8_t> *raw_vec_binary_;
 };
 
 }  // namespace tig_gamma

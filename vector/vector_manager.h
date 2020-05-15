@@ -13,7 +13,6 @@
 #include <string>
 #include "log.h"
 
-#include "gamma_api.h"
 #include "gamma_common_data.h"
 #include "gamma_index.h"
 #include "raw_vector.h"
@@ -27,35 +26,30 @@ class VectorManager {
                 int max_doc_size, const std::string &root_path, GammaCounters *counters);
   ~VectorManager();
 
-  int CreateVectorTable(VectorInfo **vectors_info, int vectors_num,
-                        IVFPQParameters *ivfpq_param);
+  int CreateVectorTable(Table &table);
 
-  int AddToStore(int docid, std::vector<Field *> &fields);
-  int Update(int docid, std::vector<Field *> &fields);
+  int AddToStore(int docid, std::vector<struct Field> &fields);
+  int Update(int docid, std::vector<struct Field> &fields);
 
   int Indexing();
 
   int AddRTVecsToIndex();
 
   // int Add(int docid, const std::vector<Field *> &field_vecs);
-  int Search(const GammaQuery &query, GammaResult *results);
+  int Search(GammaQuery &query, GammaResult *results);
 
   int GetVector(const std::vector<std::pair<std::string, int>> &fields_ids,
                 std::vector<std::string> &vec, bool is_bytearray = false);
 
-  long GetTotalMemBytes() {
-    long index_total_mem_bytes = 0;
+  void GetTotalMemBytes(long &index_total_mem_bytes, long &vector_total_mem_bytes) {
     for (auto iter = vector_indexes_.begin(); iter != vector_indexes_.end();
          iter++) {
       index_total_mem_bytes += iter->second->GetTotalMemBytes();
     }
 
-    long vector_total_mem_bytes = 0;
     for (auto iter = raw_vectors_.begin(); iter != raw_vectors_.end(); ++iter) {
       vector_total_mem_bytes += iter->second->GetTotalMemBytes();
     }
-
-    return index_total_mem_bytes + vector_total_mem_bytes;
   }
 
   int Dump(const std::string &path, int dump_docid, int max_docid);
@@ -75,6 +69,8 @@ class VectorManager {
     }
   }
 
+  int Delete(int docid);
+
  private:
   void Close();  // release all resource
 
@@ -84,11 +80,12 @@ class VectorManager {
   const char *docids_bitmap_;
   int max_doc_size_;
   bool table_created_;
-  IVFPQParameters *ivfpq_param_;
+  RetrievalParams *retrieval_param_;
   std::string root_path_;
   GammaCounters *gamma_counters_;
 
-  std::map<std::string, RawVector *> raw_vectors_;
+  std::map<std::string, RawVector<float> *> raw_vectors_;
+  std::map<std::string, RawVector<uint8_t> *> raw_binary_vectors_;
   std::map<std::string, GammaIndex *> vector_indexes_;
 };
 

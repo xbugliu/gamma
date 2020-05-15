@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 #include "concurrentqueue/blockingconcurrentqueue.h"
-#include "gamma_api.h"
 #include "profile.h"
 #include "range_query_result.h"
 
@@ -81,7 +80,7 @@ class MultiFieldsRangeIndex {
   long MemorySize(long &dense, long &sparse);
 
  private:
-  int Intersect(RangeQueryResult **results, int j, int k,
+  int Intersect(RangeQueryResult *results, int j, int k,
                 RangeQueryResult *out);
   void ResourceRecoveryWorker();
   void FieldOperateWorker();

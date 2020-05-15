@@ -12,8 +12,14 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "gamma_api.h"
+
+#include "api_data/gamma_doc.h"
+#include "api_data/gamma_table.h"
 #include "log.h"
+
+#ifdef USE_BTREE
+#include "threadskv10h.h"
+#endif
 
 #ifdef WITH_ROCKSDB
 #include "rocksdb/db.h"
@@ -36,7 +42,7 @@ class Profile {
    * @param table  table definition
    * @return 0 if successed
    */
-  int CreateTable(const Table *table);
+  int CreateTable(Table &table);
 
   /** add a doc to table
    *
@@ -44,7 +50,7 @@ class Profile {
    * @param doc_idx doc index number
    * @return 0 if successed
    */
-  int Add(const std::vector<Field *> &fields, int doc_id,
+  int Add(const std::vector<struct Field> &fields, int doc_id,
           bool is_existed = false);
 
   /** update a doc
@@ -53,7 +59,7 @@ class Profile {
    * @param doc_idx doc index number
    * @return 0 if successed
    */
-  int Update(const std::vector<Field *> &fields, int doc_id);
+  int Update(const std::vector<struct Field> &fields, int doc_id);
 
   /** get docid by key
    *
@@ -61,7 +67,7 @@ class Profile {
    * @param doc_id output, the docid to key
    * @return 0 if successed, -1 key not found
    */
-  int GetDocIDByKey(const std::string &key, int &doc_id);
+  int GetDocIDByKey(long key, int &doc_id);
 
   /** dump datas to disk
    *
@@ -71,10 +77,11 @@ class Profile {
 
   long GetMemoryBytes();
 
-  int GetDocInfo(const std::string &id, Doc *&doc);
-  int GetDocInfo(const int docid, Doc *&doc);
+  int GetDocInfo(long id, Doc &doc);
+  int GetDocInfo(const int docid, Doc &doc);
 
-  Field *GetFieldInfo(const int docid, const std::string &field_name);
+  void GetFieldInfo(const int docid, const std::string &field_name,
+                    struct Field &field);
 
   template <typename T>
   bool GetField(const int docid, const int field_id, T &value) const {
@@ -101,9 +108,11 @@ class Profile {
   int GetFieldRawValue(int docid, int field_id, unsigned char **value,
                        int &data_len);
 
+  int GetFieldType(const std::string &field, enum DataType &type);
+
   int GetAttrType(std::map<std::string, enum DataType> &attr_type_map);
 
-  int GetAttrIsIndex(std::map<std::string, int> &attr_is_index_map);
+  int GetAttrIsIndex(std::map<std::string, bool> &attr_is_index_map);
 
   int GetAttrIdx(const std::string &field) const;
 
@@ -117,7 +126,7 @@ class Profile {
   void SetFieldValue(int docid, const std::string &field, const char *value,
                      uint16_t len);
 
-  int AddField(const std::string &name, enum DataType ftype, int is_index);
+  int AddField(const std::string &name, DataType ftype, bool is_index);
 
   void ToRowKey(int id, std::string &key) const;
 
@@ -132,11 +141,11 @@ class Profile {
 
   std::map<int, std::string> idx_attr_map_;
   std::map<std::string, int> attr_idx_map_;
-  std::map<std::string, enum DataType> attr_type_map_;
-  std::map<std::string, int> attr_is_index_map_;
+  std::map<std::string, DataType> attr_type_map_;
+  std::map<std::string, bool> attr_is_index_map_;
   std::vector<int> idx_attr_offset_;
-  std::vector<enum DataType> attrs_;
-  cuckoohash_map<std::string, int> item_to_docid_;
+  std::vector<DataType> attrs_;
+  cuckoohash_map<long, int> item_to_docid_;
 
   char *mem_;
   char *str_mem_;
@@ -149,17 +158,13 @@ class Profile {
   rocksdb::DB *db_;
 #endif
   std::string db_path_;
+
+#ifdef USE_BTREE
+  BtMgr *main_mgr_;
+  BtMgr *cache_mgr_;
+#endif
 };
 
-inline struct ByteArray *StringToByteArray(const std::string &str) {
-  struct ByteArray *ba =
-      static_cast<struct ByteArray *>(malloc(sizeof(struct ByteArray)));
-  ba->len = str.length();
-  ba->value = static_cast<char *>(malloc((str.length()) * sizeof(char)));
-  memset(ba->value, 0, str.length());
-  memcpy(ba->value, str.data(), str.length());
-  return ba;
-}
 }  // namespace tig_gamma
 
 #endif

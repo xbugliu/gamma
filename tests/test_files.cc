@@ -8,11 +8,16 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
 #include <cmath>
 #include <fstream>
 #include <functional>
 #include <future>
-#include "gamma_api_generated.h"
+
+#include "common/api_data/gamma_engine_status.h"
+#include "common/api_data/gamma_request.h"
+#include "common/api_data/gamma_response.h"
+#include "common/api_data/gamma_table.h"
 #include "test.h"
 
 /**
@@ -25,102 +30,66 @@
 
 namespace test {
 
-struct Options {
-  Options() {
-    nprobe = 10;
-    doc_id = 0;
-    d = 512;
-    filter = false;
-    print_doc = false;
-    search_thread_num = 100;
-    max_doc_size = 10000 * 200;
-    add_doc_num = 10000 * 100;
-    search_num = 10000 * 1;
-    fields_vec = {"key", "_id", "field1", "field2", "field3"};
-    fields_type = {LONG, STRING, STRING, INT, INT};
-    vector_name = "abc";
-    path = "files";
-    log_dir = "log";
-    model_id = "model";
-    retrieval_type = "IVFPQ";
-    store_type = "Mmap";
-    profiles.resize(max_doc_size * fields_vec.size());
-    engine = nullptr;
-  }
-
-  int nprobe;
-  size_t doc_id;
-  size_t doc_id2;
-  size_t d;
-  size_t max_doc_size;
-  size_t add_doc_num;
-  size_t search_num;
-  bool filter;
-  bool print_doc;
-  int search_thread_num;
-  std::vector<string> fields_vec;
-  std::vector<enum DataType> fields_type;
-  string path;
-  string log_dir;
-  string vector_name;
-  string model_id;
-  string retrieval_type;
-  string store_type;
-
-  std::vector<string> profiles;
-  float *feature;
-
-  string profile_file;
-  string feature_file;
-  char *docids_bitmap_;
-  void *engine;
-};
-
 static struct Options opt;
 
 int AddDocToEngine(void *engine, int doc_num, int interval = 0) {
   for (int i = 0; i < doc_num; ++i) {
-    Field **fields = MakeFields(opt.fields_vec.size() + 1);
+    tig_gamma::Doc doc;
 
     string url;
     for (size_t j = 0; j < opt.fields_vec.size(); ++j) {
-      enum DataType data_type = opt.fields_type[j];
-      ByteArray *name = StringToByteArray(opt.fields_vec[j]);
-      ByteArray *value;
+      tig_gamma::Field field;
+      field.name = opt.fields_vec[j];
+      field.datatype = opt.fields_type[j];
+      char *value;
+      int len = 0;
 
       string &data =
           opt.profiles[(uint64_t)opt.doc_id2 * opt.fields_vec.size() + j];
-      if (opt.fields_type[j] == INT) {
-        value = static_cast<ByteArray *>(malloc(sizeof(ByteArray)));
-        value->value = static_cast<char *>(malloc(sizeof(int)));
-        value->len = sizeof(int);
+      if (opt.fields_type[j] == tig_gamma::DataType::INT) {
+        value = static_cast<char *>(malloc(sizeof(int)));
+        len = sizeof(int);
         int v = atoi(data.c_str());
-        memcpy(value->value, &v, value->len);
-      } else if (opt.fields_type[j] == LONG) {
-        value = static_cast<ByteArray *>(malloc(sizeof(ByteArray)));
-        value->value = static_cast<char *>(malloc(sizeof(long)));
-        value->len = sizeof(long);
-        long v = atol(data.c_str());
-        memcpy(value->value, &v, value->len);
+        memcpy(value, &v, len);
+
+        field.value = std::string(value, len);
+        free(value);
+      } else if (opt.fields_type[j] == tig_gamma::DataType::LONG) {
+        value = static_cast<char *>(malloc(sizeof(long)));
+        len = sizeof(long);
+        long v = opt.doc_id;
+        memcpy(value, &v, len);
+        field.value = std::string(value, len);
+        free(value);
       } else {
-        value = StringToByteArray(data + "\001all");
+        field.value = data + "\001all";
         url = data;
       }
-      ByteArray *source = StringToByteArray(url);
-      Field *field = MakeField(name, value, source, data_type);
-      SetField(fields, j, field);
+
+      field.source = url;
+
+      doc.AddField(field);
     }
 
-    ByteArray *value =
-        FloatToByteArray(opt.feature + (uint64_t)opt.doc_id * opt.d, opt.d);
-    ByteArray *name = StringToByteArray(opt.vector_name);
-    ByteArray *source = StringToByteArray(url);
-    Field *field = MakeField(name, value, source, VECTOR);
-    SetField(fields, opt.fields_vec.size(), field);
+    tig_gamma::Field field;
+    field.name = opt.vector_name;
+    field.datatype = tig_gamma::DataType::VECTOR;
+    field.source = url;
+    int len = opt.d * sizeof(float);
+    char *value = static_cast<char *>(malloc(len));
+    memcpy((void *)value, (void *)(opt.feature + (uint64_t)opt.doc_id * opt.d),
+           len);
 
-    Doc *doc = MakeDoc(fields, opt.fields_vec.size() + 1);
-    AddOrUpdateDoc(engine, doc);
-    DestroyDoc(doc);
+    field.value = std::string(value, len);
+    free(value);
+    value = nullptr;
+
+    doc.AddField(field);
+
+    char *doc_str = nullptr;
+    int doc_len = 0;
+    doc.Serialize(&doc_str, &doc_len);
+    AddOrUpdateDoc(engine, doc_str, doc_len);
     ++opt.doc_id;
     ++opt.doc_id2;
     if (interval > 0) {
@@ -138,14 +107,28 @@ int SearchThread(void *engine, size_t num) {
   string error;
   while (idx < num) {
     double start = utils::getmillisecs();
-    VectorQuery **vector_querys = MakeVectorQuerys(1);
-    ByteArray *value =
-        FloatToByteArray(opt.feature + (uint64_t)idx * opt.d, opt.d * req_num);
-    VectorQuery *vector_query = MakeVectorQuery(
-        StringToByteArray(opt.vector_name), value, 0, 10000, 0.1, 0);
-    SetVectorQuery(vector_querys, 0, vector_query);
+    struct tig_gamma::VectorQuery vector_query;
+    vector_query.name = opt.vector_name;
 
-    Request *request = nullptr;
+    int len = opt.d * sizeof(float) * req_num;
+    char *value = reinterpret_cast<char *>(opt.feature + (uint64_t)idx * opt.d);
+
+    vector_query.value = std::string(value, len);
+
+    vector_query.min_score = 0;
+    vector_query.max_score = 10000;
+    vector_query.boost = 0.1;
+    vector_query.has_boost = 0;
+
+    tig_gamma::Request request;
+    request.SetTopN(100);
+    request.AddVectorQuery(vector_query);
+    request.SetReqNum(req_num);
+    request.SetDirectSearchType(0);
+    // request.SetOnlineLogLevel("");
+    request.SetHasRank(true);
+    request.SetMultiVectorRank(0);
+    request.SetL2Sqrt(false);
 
     if (opt.filter) {
       // string c1_lower = opt.profiles[idx * (opt.fields_vec.size()) + 4];
@@ -156,87 +139,81 @@ int SearchThread(void *engine, size_t num) {
       string c1_lower = string((char *)&low, sizeof(low));
       string c1_upper = string((char *)&upper, sizeof(upper));
 
-      string name = "field2";
-      RangeFilter **range_filters = MakeRangeFilters(2);
-      RangeFilter *range_filter =
-          MakeRangeFilter(StringToByteArray(name), StringToByteArray(c1_lower),
-                          StringToByteArray(c1_upper), false, true);
-      SetRangeFilter(range_filters, 0, range_filter);
-
-      low = 0;
-      upper = 999999;
-      c1_lower = string((char *)&low, sizeof(low));
-      c1_upper = string((char *)&upper, sizeof(upper));
-      name = "field3";
-      range_filter =
-          MakeRangeFilter(StringToByteArray(name), StringToByteArray(c1_lower),
-                          StringToByteArray(c1_upper), false, true);
-      SetRangeFilter(range_filters, 1, range_filter);
-
-      TermFilter **term_filters = MakeTermFilters(1);
-      TermFilter *term_filter;
-
-      std::string term_low = string("1315\00115248");
-      name = "field1";
-      term_filter = MakeTermFilter(StringToByteArray(name),
-                                   StringToByteArray(term_low), true);
-      SetTermFilter(term_filters, 0, term_filter);
-
-      int field_num = 2;
-      ByteArray **vec_fields = MakeByteArrays(field_num);
-      ByteArray *vec_name = StringToByteArray(opt.vector_name);
-      string id_field = "_id";
-      ByteArray *id_name = StringToByteArray(id_field);
-      vec_fields[0] = vec_name;
-      vec_fields[1] = id_name;
-      request = MakeRequest(100, vector_querys, 1, vec_fields, field_num,
-                            range_filters, 2, term_filters, 1, req_num, 0,
-                            nullptr, TRUE, 0, FALSE, FALSE);
-    } else {
-      request = MakeRequest(100, vector_querys, 1, nullptr, 0, nullptr, 0,
-                            nullptr, 0, req_num, 0, nullptr, FALSE, 0, FALSE, FALSE);
-    }
-
-    {
-      ByteArray *response = SearchV2(engine, request);
-      flatbuffers::FlatBufferBuilder builder_out;
-      builder_out.PushBytes((const uint8_t *)response->value, response->len);
-      auto res = gamma_api::GetResponse(builder_out.GetCurrentBufferPointer());
-
-      for (int i = 0; i < res->results()->Length(); ++i) {
-        auto result = res->results()->Get(i);
-        int total = result->total();
-        std::string msg = result->msg()->str();
-        auto result_items = result->result_items();
-        for (int j = 0; j < result_items->Length(); ++j) {
-          auto result_item = result_items->Get(j);
-          double score = result_item->score();
-          std::string name = result_item->name()->Get(0)->str();
-        }
+      {
+        struct tig_gamma::RangeFilter range_filter;
+        range_filter.field = "field2";
+        range_filter.lower_value = string((char *)&low, sizeof(low));
+        range_filter.upper_value = string((char *)&upper, sizeof(upper));
+        range_filter.include_lower = false;
+        range_filter.include_upper = true;
+        request.AddRangeFilter(range_filter);
       }
-      DestroyByteArray(response);
+
+      {
+        struct tig_gamma::RangeFilter range_filter;
+        range_filter.field = "field3";
+        low = 0;
+        upper = 999999;
+        range_filter.lower_value = string((char *)&low, sizeof(low));
+        range_filter.upper_value = string((char *)&upper, sizeof(upper));
+        range_filter.include_lower = false;
+        range_filter.include_upper = true;
+        request.AddRangeFilter(range_filter);
+      }
+
+      tig_gamma::TermFilter term_filter;
+      term_filter.field = "field3";
+      term_filter.value = "1315\00115248";
+      term_filter.is_union = true;
+
+      request.AddTermFielter(term_filter);
+
+      std::string field_name = "field1";
+      request.AddField(field_name);
+
+      std::string id = "_id";
+      request.AddField(id);
     }
-    Response *response = Search(engine, request);
+
+    char *request_str, *response_str;
+    int request_len, response_len;
+
+    request.Serialize(&request_str, &request_len);
+    int ret =
+        Search(engine, request_str, request_len, &response_str, &response_len);
+
+    if (ret != 0) {
+      LOG(ERROR) << "Search error [" << ret << "]";
+    }
+    free(request_str);
+
+    tig_gamma::Response response;
+    response.Deserialize(response_str, response_len);
+
+    free(response_str);
 
     if (opt.print_doc) {
-      for (int i = 0; i < response->req_num; ++i) {
+      std::vector<struct tig_gamma::SearchResult> &results = response.Results();
+      for (size_t i = 0; i < results.size(); ++i) {
         int ii = idx + i;
         string msg = std::to_string(ii) + ", ";
-        SearchResult *results = GetSearchResult(response, i);
-        if (results->result_num <= 0) {
+        struct tig_gamma::SearchResult &result = results[i];
+
+        std::vector<struct tig_gamma::ResultItem> &result_items =
+            result.result_items;
+        if (result_items.size() <= 0) {
           continue;
         }
-        msg += string("total [") + std::to_string(results->total) + "], ";
-        msg += string("result_num [") + std::to_string(results->result_num) +
+        msg += string("total [") + std::to_string(result.total) + "], ";
+        msg += string("result_num [") + std::to_string(result_items.size()) +
                "], ";
-        for (int j = 0; j < results->result_num; ++j) {
-          ResultItem *result_item = GetResultItem(results, j);
-          msg += string("score [") + std::to_string(result_item->score) + "], ";
-          printDoc(result_item->doc, msg);
+        for (size_t j = 0; j < result_items.size(); ++j) {
+          struct tig_gamma::ResultItem &result_item = result_items[j];
+          printDoc(result_item, msg, opt);
           msg += "\n";
         }
-        if (abs(GetResultItem(results, 0)->score - 1.0) < 0.001) {
-          if (ii % 1000 == 0) {
+        if (abs(result_items[0].score - 1.0) < 0.001) {
+          if (ii % 100 == 0) {
             LOG(INFO) << msg;
           }
         } else {
@@ -249,9 +226,6 @@ int SearchThread(void *engine, size_t num) {
         }
       }
     }
-
-    DestroyRequest(request);
-    DestroyResponse(response);
     double elap = utils::getmillisecs() - start;
     time += elap;
     if (idx % 10000 == 0) {
@@ -269,81 +243,112 @@ int SearchThread(void *engine, size_t num) {
 }
 
 int GetVector(void *engine) {
-  int idx = 1;
-  int req_num = 1;
+  tig_gamma::Request request;
+  request.SetTopN(10);
+  request.SetReqNum(1);
+  request.SetDirectSearchType(0);
+  // request.SetOnlineLogLevel("");
+  request.SetHasRank(true);
+  request.SetMultiVectorRank(0);
+  request.SetL2Sqrt(false);
 
-  TermFilter **term_filters = MakeTermFilters(1);
-  TermFilter *term_filter = MakeTermFilter(StringToByteArray(opt.vector_name),
-                                           StringToByteArray("1.jpg"), false);
-  SetTermFilter(term_filters, 0, term_filter);
+  tig_gamma::TermFilter term_filter;
+  term_filter.field = opt.vector_name;
+  term_filter.value = "1.jpg";
+  term_filter.is_union = false;
 
-  Request *request = MakeRequest(10, nullptr, 0, nullptr, 0, nullptr, 0,
-                                 term_filters, 1, req_num, 0, nullptr, TRUE, 0, FALSE, FALSE);
+  request.AddTermFielter(term_filter);
 
-  Response *response = Search(engine, request);
-  for (int i = 0; i < response->req_num; ++i) {
-    int ii = idx + i;
-    string msg = std::to_string(ii) + ", ";
-    SearchResult *results = GetSearchResult(response, i);
-    if (results->result_num <= 0) {
+  char *request_str, *response_str;
+  int request_len, response_len;
+
+  request.Serialize(&request_str, &request_len);
+  int ret =
+      Search(engine, request_str, request_len, &response_str, &response_len);
+
+  free(request_str);
+
+  tig_gamma::Response response;
+  response.Deserialize(response_str, response_len);
+
+  free(response_str);
+
+  std::vector<struct tig_gamma::SearchResult> &results = response.Results();
+
+  for (size_t i = 0; i < results.size(); ++i) {
+    std::string msg = std::to_string(i) + ", ";
+    struct tig_gamma::SearchResult &result = results[i];
+
+    std::vector<struct tig_gamma::ResultItem> &result_items =
+        result.result_items;
+    if (result_items.size() <= 0) {
       continue;
     }
-    msg += string("total [") + std::to_string(results->total) + "], ";
-    msg += string("result_num [") + std::to_string(results->result_num) + "], ";
-    for (int j = 0; j < results->result_num; ++j) {
-      ResultItem *result_item = GetResultItem(results, j);
-      msg += string("score [") + std::to_string(result_item->score) + "], ";
-      LOG(INFO) << string(result_item->extra->value, result_item->extra->len);
-      printDoc(result_item->doc, msg);
+    msg += string("total [") + std::to_string(result.total) + "], ";
+    msg += string("result_num [") + std::to_string(result_items.size()) + "], ";
+    for (size_t j = 0; j < result_items.size(); ++j) {
+      struct tig_gamma::ResultItem &result_item = result_items[j];
+      printDoc(result_item, msg, opt);
       msg += "\n";
     }
+    LOG(INFO) << msg;
   }
   return 0;
 }
 
 void UpdateThread(void *engine) {
   int doc_id = 0;
-  Field **fields = MakeFields(opt.fields_vec.size() + 1);
+  tig_gamma::Doc doc;
 
   for (size_t j = 0; j < opt.fields_vec.size(); ++j) {
-    enum DataType data_type = opt.fields_type[j];
-    ByteArray *name = StringToByteArray(opt.fields_vec[j]);
-    ByteArray *value;
+    tig_gamma::DataType data_type = opt.fields_type[j];
+    std::string &name = opt.fields_vec[j];
 
-    string &data = opt.profiles[(uint64_t)doc_id * opt.fields_vec.size() + j];
-    if (opt.fields_type[j] == INT) {
-      value = static_cast<ByteArray *>(malloc(sizeof(ByteArray)));
-      value->value = static_cast<char *>(malloc(sizeof(int)));
-      value->len = sizeof(int);
+    tig_gamma::Field field;
+    field.name = name;
+    field.source = "abc";
+    field.datatype = data_type;
+
+    std::string &data =
+        opt.profiles[(uint64_t)doc_id * opt.fields_vec.size() + j];
+    if (opt.fields_type[j] == tig_gamma::DataType::INT) {
+      char *value_str = static_cast<char *>(malloc(sizeof(int)));
+      int len = sizeof(int);
       int v = atoi("88");
-      memcpy(value->value, &v, value->len);
-    } else if (opt.fields_type[j] == LONG) {
-      value = static_cast<ByteArray *>(malloc(sizeof(ByteArray)));
-      value->value = static_cast<char *>(malloc(sizeof(long)));
-      value->len = sizeof(long);
+      memcpy(value_str, &v, len);
+      field.value = std::string(value_str, len);
+      free(value_str);
+    } else if (opt.fields_type[j] == tig_gamma::DataType::LONG) {
+      char *value_str = static_cast<char *>(malloc(sizeof(long)));
+      int len = sizeof(long);
       long v = atol(data.c_str());
-      memcpy(value->value, &v, value->len);
+      memcpy(value_str, &v, len);
+      field.value = std::string(value_str, len);
+      free(value_str);
     } else {
-      value = StringToByteArray(data);
+      field.value = data;
     }
-    ByteArray *source = StringToByteArray(string("abc"));
-    Field *field = MakeField(name, value, source, data_type);
-    SetField(fields, j, field);
+    doc.AddField(field);
   }
 
-  ByteArray *value =
-      FloatToByteArray(opt.feature + (uint64_t)doc_id * opt.d, opt.d);
-  ByteArray *name = StringToByteArray(opt.vector_name);
-  ByteArray *source = StringToByteArray(string("abc"));
-  Field *field = MakeField(name, value, source, VECTOR);
-  SetField(fields, opt.fields_vec.size(), field);
+  tig_gamma::Field field;
+  field.name = opt.vector_name;
+  field.source = "abc";
+  field.datatype = tig_gamma::DataType::VECTOR;
+  field.value = std::string(
+      reinterpret_cast<char *>(opt.feature + (uint64_t)doc_id * opt.d),
+      opt.d * sizeof(float));
+  doc.AddField(field);
 
-  Doc *doc = MakeDoc(fields, opt.fields_vec.size() + 1);
-  UpdateDoc(engine, doc);
-  DestroyDoc(doc);
+  char *doc_str = nullptr;
+  int len = 0;
+  doc.Serialize(&doc_str, &len);
+
+  UpdateDoc(engine, doc_str, len);
+  free(doc_str);
 }
 
-int Init() {
+int InitEngine() {
 #ifdef PERFORMANCE_TESTING
   int fd = open(opt.feature_file.c_str(), O_RDONLY, 0);
   size_t mmap_size = opt.add_doc_num * sizeof(float) * opt.d;
@@ -365,42 +370,65 @@ int Init() {
   if (ret != 0) {
     LOG(ERROR) << "Create bitmap failed!";
   }
+
   assert(opt.docids_bitmap_ != nullptr);
-  Config *config = MakeConfig(StringToByteArray(opt.path), opt.max_doc_size);
-  SetLogDictionary(StringToByteArray(opt.log_dir));
-  opt.engine = Init(config);
-  DestroyConfig(config);
+  tig_gamma::Config config;
+  config.SetPath(opt.path);
+  config.SetLogDir(opt.log_dir);
+  config.SetMaxDocSize(opt.max_doc_size);
+
+  char *config_str = nullptr;
+  int len = 0;
+  config.Serialize(&config_str, &len);
+  opt.engine = Init(config_str, len);
+  free(config_str);
+  config_str = nullptr;
+
   assert(opt.engine != nullptr);
   return 0;
 }
 
-int CreateTable() {
-  ByteArray *table_name = MakeByteArray("test", 4);
-  FieldInfo **field_infos = MakeFieldInfos(opt.fields_vec.size());
+int Create() {
+  tig_gamma::Table table;
+  table.SetName(opt.vector_name);
+  table.SetVectorsNum(1);
+  table.SetRetrievalType(opt.retrieval_type);
+  table.SetRetrievalParam(kIVFPQParam);
+  table.SetIndexingSize(opt.indexing_size);
 
   for (size_t i = 0; i < opt.fields_vec.size(); ++i) {
+    struct tig_gamma::FieldInfo field_info;
+    field_info.name = opt.fields_vec[i];
+
     char is_index = 0;
     if (opt.filter && (i == 0 || i == 2 || i == 3 || i == 4)) {
       is_index = 1;
     }
-    FieldInfo *field_info = MakeFieldInfo(StringToByteArray(opt.fields_vec[i]),
-                                          opt.fields_type[i], is_index);
-    SetFieldInfo(field_infos, i, field_info);
+    field_info.is_index = is_index;
+    field_info.data_type = opt.fields_type[i];
+    table.AddField(field_info);
   }
 
-  string store_p = "{\"cache_size\": 2048}";
-  ByteArray *store_param = StringToByteArray(store_p);
-  VectorInfo **vectors_info = MakeVectorInfos(1);
-  VectorInfo *vector_info = MakeVectorInfo(
-      StringToByteArray(opt.vector_name), FLOAT, TRUE, opt.d,
-      StringToByteArray(opt.model_id), StringToByteArray(opt.retrieval_type),
-      StringToByteArray(opt.store_type), store_param);
-  SetVectorInfo(vectors_info, 0, vector_info);
+  struct tig_gamma::VectorInfo vector_info;
+  vector_info.name = opt.vector_name;
+  vector_info.data_type = tig_gamma::DataType::FLOAT;
+  vector_info.is_index = true;
+  vector_info.dimension = opt.d;
+  vector_info.model_id = opt.model_id;
+  vector_info.store_type = opt.store_type;
+  vector_info.store_param = "{\"cache_size\": 2048}";
+  vector_info.has_source = false;
 
-  Table *table = MakeTable(table_name, field_infos, opt.fields_vec.size(),
-                           vectors_info, 1, kIVFPQParam);
-  enum ResponseCode ret = CreateTable(opt.engine, table);
-  DestroyTable(table);
+  table.AddVectorInfo(vector_info);
+
+  char *table_str = nullptr;
+  int len = 0;
+  table.Serialize(&table_str, &len);
+
+  int ret = CreateTable(opt.engine, table_str, len);
+
+  free(table_str);
+
   return ret;
 }
 
@@ -432,12 +460,18 @@ int Add() {
 }
 
 int BuildEngineIndex() {
-  std::thread t(BuildIndex, opt.engine);
-  t.detach();
-
-  while (GetIndexStatus(opt.engine) != INDEXED) {
+  // BuildIndex(opt.engine);
+  int n_index_status = -1;
+  do {
+    char *status = nullptr;
+    int len = 0;
+    GetEngineStatus(opt.engine, &status, &len);
+    tig_gamma::EngineStatus engine_status;
+    engine_status.Deserialize(status, len);
+    free(status);
     std::this_thread::sleep_for(std::chrono::seconds(2));
-  }
+    n_index_status = engine_status.IndexStatus();
+  } while (n_index_status != 2);
 
   // string docid = "1.jpg";
   // ByteArray *value = StringToByteArray(docid);
@@ -446,9 +480,9 @@ int BuildEngineIndex() {
   // doc = GetDocByID(opt.engine, value);
 
   LOG(INFO) << "Indexed!";
-  UpdateThread(opt.engine);
+  // UpdateThread(opt.engine);
   GetVector(opt.engine);
-  opt.doc_id = 0;
+  // opt.doc_id = 0;
   opt.doc_id2 = 1;
   return 0;
 }
@@ -512,9 +546,15 @@ int LoadEngine() {
   if (ret != 0) {
     LOG(ERROR) << "Create bitmap failed!";
   }
-  Config *config = MakeConfig(StringToByteArray(opt.path), opt.max_doc_size);
-  opt.engine = Init(config);
-  DestroyConfig(config);
+  tig_gamma::Config config;
+  config.SetMaxDocSize(opt.max_doc_size);
+  config.SetPath(opt.path);
+
+  char *config_str;
+  int config_len;
+  config.Serialize(&config_str, &config_len);
+
+  opt.engine = Init(config_str, config_len);
 
   ret = Load(opt.engine);
   return ret;
@@ -549,11 +589,11 @@ int main(int argc, char **argv) {
   test::opt.feature_file = argv[2];
   std::cout << test::opt.profile_file.c_str() << " "
             << test::opt.feature_file.c_str() << std::endl;
-  test::Init();
-  test::CreateTable();
+  test::InitEngine();
+  test::Create();
   test::Add();
   test::BuildEngineIndex();
-  test::Add();
+  // test::Add();
   test::Search();
   // test::DumpEngine();
   // test::LoadEngine();
